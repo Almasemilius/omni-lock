@@ -2,10 +2,9 @@
 import socket
 import time
 import logging
-import struct
-import datetime
 import threading
 from typing import Dict
+from datetime import datetime
 from config import *
 
 # Setup logging
@@ -20,21 +19,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class BikeLockServer:
-    def __init__(self, host, port, secret_key):
+    # Command prefixes
+    PREFIX_BYTES = bytes([0xFF, 0xFF])
+    CMD_HEADER = "*CMDS"
+    MANUFACTURER = "OM"
+    
+    def __init__(self, host, port):
         """Initialize the bike lock server.
         
         Args:
             host (str): IP address for the server to listen on
             port (int): Port number for TCP communication
-            secret_key (str): Secret key for secure communication
         """
         self.host = host
         self.port = port
-        self.secret_key = secret_key
         self.server_socket = None
         self.running = False
         self.connected_locks: Dict[str, socket.socket] = {}
         self.lock_thread = None
+        self.lock_info: Dict[str, dict] = {}  # Store IMEI and other info for each lock
     
     def start(self):
         """Start the TCP server to listen for lock connections."""
@@ -92,30 +95,23 @@ class BikeLockServer:
                     logger.error(f"Error accepting connection: {e}")
     
     def _handle_lock_connection(self, client_socket: socket.socket, address):
-        """Handle communication with a connected lock.
-        
-        Args:
-            client_socket: Socket connection to the lock
-            address: Address of the connected lock
-        """
+        """Handle communication with a connected lock."""
         lock_id = None
         try:
-            # First message should be the lock's identification
-            data = client_socket.recv(1024)
-            if data:
-                # TODO: Implement proper parsing of lock identification message
-                lock_id = data.decode('utf-8').strip()
-                self.connected_locks[lock_id] = client_socket
-                logger.info(f"Lock {lock_id} registered from {address}")
+            # Use the address as the lock identifier
+            lock_id = f"lock_{address[0]}_{address[1]}"
+            self.connected_locks[lock_id] = client_socket
+            logger.info(f"Lock {lock_id} connected from {address}")
             
             while self.running:
                 data = client_socket.recv(1024)
                 if not data:
                     break
                 
-                # Handle incoming messages from the lock
-                self._handle_lock_message(lock_id, data)
+                # Log received data
+                logger.info(f"Received from {lock_id}: {data.hex()}")
                 
+                self._handle_lock_message(lock_id, data)
         except Exception as e:
             logger.error(f"Error handling lock connection: {e}")
         finally:
@@ -127,137 +123,141 @@ class BikeLockServer:
                 pass
             logger.info(f"Lock {lock_id} disconnected from {address}")
     
-    def _handle_lock_message(self, lock_id: str, message: bytes):
-        """Handle incoming messages from locks.
+    def _handle_lock_message(self, lock_id: str, data: bytes):
+        """Handle incoming messages from locks."""
+        imei, cmd, params = self._parse_response(data)
+        if not imei:
+            return
         
-        Args:
-            lock_id: ID of the lock sending the message
-            message: Message received from the lock
+        logger.info(f"Received from {lock_id} - CMD: {cmd}, Params: {params}")
+        
+        # Store IMEI for the lock
+        self.lock_info[lock_id] = {"imei": imei}
+        
+        # Handle different command responses
+        if cmd == "Q0":  # Check-in
+            voltage = int(params[0]) if params else 0
+            logger.info(f"Lock {lock_id} check-in, voltage: {voltage/100:.2f}V")
+            
+        elif cmd == "H0":  # Heartbeat
+            status, voltage, signal = params if len(params) >= 3 else (0, 0, 0)
+            logger.info(f"Lock {lock_id} heartbeat - Status: {'Unlocked' if status=='0' else 'Locked'}, "
+                       f"Voltage: {int(voltage)/100:.2f}V, Signal: {signal}")
+            
+        elif cmd in ["L0", "L1"]:  # Lock/Unlock response
+            result = "Success" if params[0] == "0" else "Failed"
+            logger.info(f"Lock {lock_id} {cmd} operation: {result}")
+            
+        elif cmd == "S5":  # Status response
+            if len(params) >= 5:
+                voltage, signal, gps_sats, lock_status, _ = params
+                logger.info(f"Lock {lock_id} status - Voltage: {int(voltage)/100:.2f}V, "
+                          f"Signal: {signal}, GPS Satellites: {gps_sats}, "
+                          f"Status: {'Unlocked' if lock_status=='0' else 'Locked'}")
+    
+    def _format_command(self, imei: str, cmd: str, *params) -> bytes:
+        """Format command according to the protocol.
+        
+        Format: 0xFFFF*CMDS,OM,IMEI,TIMESTAMP,CMD,PARAMS#\n
+        """
+        timestamp = datetime.now().strftime("%y%m%d%H%M%S")
+        params_str = ",".join(str(p) for p in params) if params else ""
+        cmd_str = f"{self.CMD_HEADER},{self.MANUFACTURER},{imei},{timestamp},{cmd}"
+        if params_str:
+            cmd_str += f",{params_str}"
+        cmd_str += "#\n"
+        
+        return self.PREFIX_BYTES + cmd_str.encode('ascii')
+    
+    def _parse_response(self, data: bytes) -> tuple:
+        """Parse response from lock.
+        
+        Format: *CMDR,OM,IMEI,TIMESTAMP,CMD,PARAMS#
+        Returns: (imei, cmd, params)
         """
         try:
-            # TODO: Implement proper message parsing and handling
-            logger.info(f"Received message from lock {lock_id}: {message}")
-        except Exception as e:
-            logger.error(f"Error handling message from lock {lock_id}: {e}")
-    
-    def _send_command(self, lock_id: str, command_bytes: bytes) -> bytes:
-        """Send a command to a specific lock.
-        
-        Args:
-            lock_id: ID of the lock to send command to
-            command_bytes: The formatted command to send
+            # Decode and remove trailing newline
+            msg = data.decode('ascii').strip()
+            if not msg.startswith("*CMDR"):
+                return None, None, None
             
-        Returns:
-            bytes: Response from the lock
-        """
+            # Split the message parts
+            parts = msg.rstrip('#').split(',')
+            if len(parts) < 5:
+                return None, None, None
+            
+            imei = parts[2]
+            cmd = parts[4]
+            params = parts[5:] if len(parts) > 5 else []
+            
+            return imei, cmd, params
+        except Exception as e:
+            logger.error(f"Error parsing response: {e}")
+            return None, None, None
+    
+    def _send_command(self, lock_id: str, command_bytes: bytes) -> bool:
+        """Send a command to a specific lock."""
         if lock_id not in self.connected_locks:
             raise ValueError(f"Lock {lock_id} is not connected")
         
         try:
             sock = self.connected_locks[lock_id]
             sock.send(command_bytes)
-            response = sock.recv(1024)
-            return response
+            logger.info(f"Sent to {lock_id}: {command_bytes.hex()}")
+            return True
         except Exception as e:
             logger.error(f"Error sending command to lock {lock_id}: {e}")
-            raise
+            return False
     
-    def unlock(self, lock_id: str, user_id: str, retain_riding_time=True):
+    def unlock(self, lock_id: str, reset_time: bool = True):
         """Send unlock command to a specific lock.
         
         Args:
             lock_id: ID of the lock to unlock
-            user_id: ID of the user unlocking the bike
-            retain_riding_time: Whether to retain previous riding time
-            
-        Returns:
-            tuple: (success: bool, message: str)
+            reset_time: Whether to reset riding time (True) or retain it (False)
         """
-        command = self._format_command(
-            "L0",
-            user_id,
-            retain_time=retain_riding_time
-        )
-        response = self._send_command(lock_id, command)
-        return self._parse_response(response)
+        if lock_id not in self.lock_info:
+            raise ValueError(f"Lock {lock_id} not recognized")
+        
+        imei = self.lock_info[lock_id]["imei"]
+        user_id = "1234"  # Example user ID
+        timestamp = str(int(time.time()))
+        
+        command = self._format_command(imei, "L0", "1" if not reset_time else "0", user_id, timestamp)
+        return self._send_command(lock_id, command)
     
-    def lock(self, lock_id: str, user_id: str, ride_duration=None):
-        """Send lock command to a specific lock.
+    def lock(self, lock_id: str):
+        """Send lock command to a specific lock."""
+        if lock_id not in self.lock_info:
+            raise ValueError(f"Lock {lock_id} not recognized")
         
-        Args:
-            lock_id: ID of the lock to lock
-            user_id: ID of the user locking the bike
-            ride_duration: Duration of the ride in seconds
-            
-        Returns:
-            tuple: (success: bool, message: str)
-        """
-        command = self._format_command(
-            "L1",
-            user_id,
-            ride_duration=ride_duration
-        )
-        response = self._send_command(lock_id, command)
-        return self._parse_response(response)
+        imei = self.lock_info[lock_id]["imei"]
+        command = self._format_command(imei, "L1")
+        return self._send_command(lock_id, command)
     
-    def get_status(self, lock_id: str, user_id: str):
-        """Query the status of a specific lock.
+    def get_status(self, lock_id: str):
+        """Query the status of a specific lock."""
+        if lock_id not in self.lock_info:
+            raise ValueError(f"Lock {lock_id} not recognized")
         
-        Args:
-            lock_id: ID of the lock to query
-            user_id: ID of the user querying the status
-            
-        Returns:
-            tuple: (success: bool, message: str)
-        """
-        command = self._format_command(
-            "S5",
-            user_id
-        )
-        response = self._send_command(lock_id, command)
-        return self._parse_response(response)
-    
-    def _format_command(self, cmd_type, user_id, **kwargs):
-        """Format command according to the protocol."""
-        timestamp = int(time.time())
-        
-        # Basic command structure
-        command = {
-            "cmd": cmd_type,
-            "user_id": user_id,
-            "timestamp": timestamp
-        }
-        
-        # Add command-specific parameters
-        command.update(kwargs)
-        
-        # TODO: Implement proper command formatting and encryption using secret_key
-        command_str = f"{command['cmd']}|{command['user_id']}|{command['timestamp']}"
-        return command_str.encode('utf-8')
-    
-    def _parse_response(self, response):
-        """Parse the response from the lock."""
-        try:
-            # TODO: Implement proper response parsing according to the protocol
-            response_code = int(response.decode('utf-8').split('|')[0])
-            return response_code == 0, "Success" if response_code == 0 else "Failed"
-        except Exception as e:
-            logger.error(f"Error parsing response: {e}")
-            return False, "Failed to parse response"
+        imei = self.lock_info[lock_id]["imei"]
+        command = self._format_command(imei, "S5")
+        return self._send_command(lock_id, command)
 
 def print_commands():
     """Print available commands."""
     print("\nAvailable commands (type the command exactly as shown):")
-    print("list                     - List all connected locks")
-    print("status <lock_id> <user_id>  - Get lock status (e.g., status LOCK001 USER123)")
-    print("unlock <lock_id> <user_id>  - Unlock a bike (e.g., unlock LOCK001 USER123)")
-    print("lock <lock_id> <user_id>    - Lock a bike (e.g., lock LOCK001 USER123)")
-    print("quit                     - Exit the program")
-    print("\nNote: Don't use the numbers, type the actual command name!")
-    print("Example: Type 'unlock LOCK001 USER123' to unlock bike LOCK001")
+    print("list                - List all connected locks with their status")
+    print("status <lock_id>    - Get detailed lock status (voltage, signal, GPS)")
+    print("unlock <lock_id>    - Unlock a bike (with ride time reset)")
+    print("unlock_temp <lock_id> - Unlock a bike (preserve ride time)")
+    print("lock <lock_id>      - Lock a bike")
+    print("quit                - Exit the program")
+    print("\nNote: lock_id will be shown when you use the 'list' command")
+    print("Example: unlock lock_192.168.1.100_12345")
 
 if __name__ == "__main__":
-    server = BikeLockServer(SERVER_HOST, SERVER_PORT, SECRET_KEY)
+    server = BikeLockServer(SERVER_HOST, SERVER_PORT)
     
     try:
         if server.start():
@@ -278,24 +278,28 @@ if __name__ == "__main__":
                     elif cmd == "list":
                         print("\nConnected locks:")
                         for lock_id in server.connected_locks:
-                            print(f"- {lock_id}")
-                    elif cmd in ["status", "lock", "unlock"]:
-                        if len(command) != 3:
-                            print(f"Usage: {cmd} <lock_id> <user_id>")
+                            info = server.lock_info.get(lock_id, {})
+                            imei = info.get("imei", "Unknown IMEI")
+                            print(f"- {lock_id} (IMEI: {imei})")
+                    elif cmd in ["status", "lock", "unlock", "unlock_temp"]:
+                        if len(command) != 2:
+                            print(f"Usage: {cmd} <lock_id>")
                             continue
                             
                         lock_id = command[1]
-                        user_id = command[2]
                         
                         try:
                             if cmd == "status":
-                                success, message = server.get_status(lock_id, user_id)
+                                success = server.get_status(lock_id)
+                            elif cmd == "unlock_temp":
+                                success = server.unlock(lock_id, reset_time=False)
                             elif cmd == "unlock":
-                                success, message = server.unlock(lock_id, user_id)
+                                success = server.unlock(lock_id, reset_time=True)
                             else:  # lock
-                                success, message = server.lock(lock_id, user_id)
+                                success = server.lock(lock_id)
                             
-                            print(f"Result: {message}")
+                            print(f"Command sent: {'Success' if success else 'Failed'}")
+                            print("Check the logs for the lock's response")
                         except ValueError as e:
                             print(f"Error: {e}")
                     else:
