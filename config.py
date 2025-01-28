@@ -7,4 +7,4 @@ SECRET_KEY = "your_secret_key"  # IMPORTANT: Change this to a strong secret key!
 
 # Logging
 LOG_LEVEL = "INFO"
-LOG_FILE = "/var/log/bike-lock-server.log"  # Changed to system log directory 
+LOG_FILE = "bike-lock-server.log"  # Changed to local directory for easier access 
