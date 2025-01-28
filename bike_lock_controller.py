@@ -22,7 +22,7 @@ class BikeLockServer:
     # Command prefixes
     PREFIX_BYTES = bytes([0xFF, 0xFF])
     CMD_HEADER = "*CMDS"
-    MANUFACTURER = "OM"
+    MANUFACTURER = "TJ"  # Changed to match your device's manufacturer code
     
     def __init__(self, host, port):
         """Initialize the bike lock server.
@@ -111,12 +111,21 @@ class BikeLockServer:
                 # Log received data
                 logger.info(f"Received from {lock_id}: {data.hex()}")
                 
+                # Try to parse the message and store IMEI
+                imei, cmd, params = self._parse_response(data)
+                if imei:
+                    self.lock_info[lock_id] = {"imei": imei}
+                    logger.info(f"Updated lock info - ID: {lock_id}, IMEI: {imei}")
+                
                 self._handle_lock_message(lock_id, data)
+                
         except Exception as e:
             logger.error(f"Error handling lock connection: {e}")
         finally:
             if lock_id and lock_id in self.connected_locks:
                 del self.connected_locks[lock_id]
+            if lock_id and lock_id in self.lock_info:
+                del self.lock_info[lock_id]
             try:
                 client_socket.close()
             except:
@@ -130,9 +139,6 @@ class BikeLockServer:
             return
         
         logger.info(f"Received from {lock_id} - CMD: {cmd}, Params: {params}")
-        
-        # Store IMEI for the lock
-        self.lock_info[lock_id] = {"imei": imei}
         
         # Handle different command responses
         if cmd == "Q0":  # Check-in
@@ -154,11 +160,38 @@ class BikeLockServer:
                 logger.info(f"Lock {lock_id} status - Voltage: {int(voltage)/100:.2f}V, "
                           f"Signal: {signal}, GPS Satellites: {gps_sats}, "
                           f"Status: {'Unlocked' if lock_status=='0' else 'Locked'}")
+                          
+        elif cmd == "D0":  # Location response
+            if len(params) >= 3:
+                _, time_utc, location_status = params[0:3]
+                if location_status == 'A':  # Valid location
+                    lat, lat_hemi, lon, lon_hemi = params[3:7]
+                    satellites = params[7] if len(params) > 7 else "Unknown"
+                    hdop = params[8] if len(params) > 8 else "Unknown"
+                    
+                    # Convert DDMM.MMMM to decimal degrees
+                    try:
+                        lat_deg = float(lat[0:2]) + float(lat[2:])/60
+                        if lat_hemi == 'S': lat_deg = -lat_deg
+                        
+                        lon_deg = float(lon[0:3]) + float(lon[3:])/60
+                        if lon_hemi == 'W': lon_deg = -lon_deg
+                        
+                        logger.info(f"Lock {lock_id} location - "
+                                  f"Time: {time_utc}, "
+                                  f"Lat: {lat_deg:.6f}°, "
+                                  f"Lon: {lon_deg:.6f}°, "
+                                  f"Satellites: {satellites}, "
+                                  f"HDOP: {hdop}")
+                    except:
+                        pass
+                else:
+                    logger.info(f"Lock {lock_id} location - Invalid/No Fix")
     
     def _format_command(self, imei: str, cmd: str, *params) -> bytes:
         """Format command according to the protocol.
         
-        Format: 0xFFFF*CMDS,OM,IMEI,TIMESTAMP,CMD,PARAMS#\n
+        Format: 0xFFFF*CMDS,TJ,IMEI,TIMESTAMP,CMD,PARAMS#\n
         """
         timestamp = datetime.now().strftime("%y%m%d%H%M%S")
         params_str = ",".join(str(p) for p in params) if params else ""
@@ -172,7 +205,7 @@ class BikeLockServer:
     def _parse_response(self, data: bytes) -> tuple:
         """Parse response from lock.
         
-        Format: *CMDR,OM,IMEI,TIMESTAMP,CMD,PARAMS#
+        Format: *CMDR,TJ,IMEI,TIMESTAMP,CMD,PARAMS#
         Returns: (imei, cmd, params)
         """
         try:
@@ -186,10 +219,13 @@ class BikeLockServer:
             if len(parts) < 5:
                 return None, None, None
             
+            # Store manufacturer code and IMEI
+            manufacturer = parts[1]
             imei = parts[2]
             cmd = parts[4]
             params = parts[5:] if len(parts) > 5 else []
             
+            logger.info(f"Parsed message - Manufacturer: {manufacturer}, IMEI: {imei}, CMD: {cmd}")
             return imei, cmd, params
         except Exception as e:
             logger.error(f"Error parsing response: {e}")
@@ -210,14 +246,19 @@ class BikeLockServer:
             return False
     
     def unlock(self, lock_id: str, reset_time: bool = True):
-        """Send unlock command to a specific lock.
+        """Send unlock command to a specific lock."""
+        if lock_id not in self.connected_locks:
+            raise ValueError(f"Lock {lock_id} is not connected")
         
-        Args:
-            lock_id: ID of the lock to unlock
-            reset_time: Whether to reset riding time (True) or retain it (False)
-        """
-        if lock_id not in self.lock_info:
-            raise ValueError(f"Lock {lock_id} not recognized")
+        # Get IMEI from lock_info, or wait for it
+        retries = 3
+        while retries > 0 and (lock_id not in self.lock_info or "imei" not in self.lock_info[lock_id]):
+            logger.info(f"Waiting for lock {lock_id} info... ({retries} retries left)")
+            time.sleep(1)
+            retries -= 1
+        
+        if lock_id not in self.lock_info or "imei" not in self.lock_info[lock_id]:
+            raise ValueError(f"Lock {lock_id} IMEI not available. Please try again.")
         
         imei = self.lock_info[lock_id]["imei"]
         user_id = "1234"  # Example user ID
