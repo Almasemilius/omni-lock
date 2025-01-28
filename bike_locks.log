@@ -1,0 +1,11 @@
+2025-01-27 21:39:46,002 - __main__ - ERROR - Failed to start server: [Errno 48] Address already in use
+2025-01-27 21:39:46,002 - __main__ - INFO - Server stopped
+2025-01-27 21:40:06,362 - __main__ - INFO - Server started on 0.0.0.0:8081
+2025-01-27 21:40:06,363 - __main__ - INFO - Server started successfully
+2025-01-27 21:41:24,252 - __main__ - INFO - Server stopped
+2025-01-27 21:41:27,987 - __main__ - INFO - Server started on 0.0.0.0:8081
+2025-01-27 21:41:27,987 - __main__ - INFO - Server started successfully
+2025-01-27 21:43:33,049 - __main__ - INFO - Server stopped
+2025-01-27 21:43:53,891 - __main__ - INFO - Server started on 0.0.0.0:8081
+2025-01-27 21:43:53,891 - __main__ - INFO - Server started successfully
+2025-01-27 21:45:47,926 - __main__ - INFO - Server stopped
